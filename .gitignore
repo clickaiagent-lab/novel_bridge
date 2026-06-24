@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+reddit_demand_data.csv
+Readme_extracted.txt
