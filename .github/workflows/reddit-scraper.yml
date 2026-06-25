@@ -34,9 +34,16 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: python upload_to_google_sheets.py
 
-      - name: Upload CSV artifact
+      - name: Upload raw discussions artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-discussions-data
+          path: raw_discussions.csv
+          if-no-files-found: error
+
+      - name: Upload aggregate artifact
         uses: actions/upload-artifact@v4
         with:
           name: reddit-demand-data
           path: reddit_demand_data.csv
-          if-no-files-found: error
+          if-no-files-found: ignore

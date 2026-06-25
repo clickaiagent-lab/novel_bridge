@@ -1,10 +1,39 @@
-# Novel Bridge Reddit Demand Scraper
+# Novel Bridge Opportunity Engine Phase 1
 
-This project is a Reddit research pipeline for Novel Bridge.
+This repository is the Phase 1 Reddit intake pipeline for Novel Bridge.
 
-Novel Bridge helps international readers discover and legally read Asian web novels and related source works from Korea, China, and Japan. This scraper focuses on titles that show strong continuation demand together with high access friction.
+Novel Bridge helps international readers discover and legally read Asian web novels and related source works from Korea, China, and Japan. In Phase 1, the goal is to collect raw Reddit discussions first, preserve them in Google Sheets, and only then review and classify them with AI or manual analysis.
 
-The script writes a ranked CSV file named `reddit_demand_data.csv`.
+## Phase 1 architecture
+
+Phase 1 now produces two CSV outputs:
+
+1. `raw_discussions.csv`
+2. `reddit_demand_data.csv`
+
+`raw_discussions.csv` is the main output and the source of truth.
+
+`reddit_demand_data.csv` is a backward-compatible aggregate view derived from the raw discussion rows when possible.
+
+## Google Sheet structure
+
+Spreadsheet:
+
+- Name: `Novel Bridge Reddit Demand`
+- Spreadsheet ID: `1HHejoNqiAbhiamU9aUn1smWx86okO09D5K7KdEy9200`
+
+Phase 1 tabs:
+
+- `Raw_Discussions`: append-only raw intake from each scraper run
+- `AI_Review`: manual or ChatGPT-assisted review and classification
+- `Title_Opportunities`: final opportunity decisions
+
+Legacy aggregate tabs still supported:
+
+- `Latest`: latest aggregate CSV snapshot
+- `History`: append-only historical aggregate rows
+- `Dashboard`
+- `Settings`
 
 ## Modes
 
@@ -14,11 +43,19 @@ By default, the scraper runs without Reddit API credentials.
 
 - Source: Reddit RSS search
 - Credentials required: none
-- Best for: immediate MVP runs in GitHub Actions and local smoke tests
+- Output: one raw row per RSS result
 
-The scraper uses RSS URLs in this shape:
+RSS mode captures:
 
-`https://www.reddit.com/r/{subreddit}/search.rss?q={query}&restrict_sr=on&sort=relevance&t=year`
+- subreddit
+- query
+- post title
+- summary/body
+- URL
+- matched keywords
+- fetch mode
+
+RSS mode does not reliably expose Reddit score or comment count, so those fields are written as `0`.
 
 ### Optional mode: Reddit API via PRAW
 
@@ -28,28 +65,37 @@ If these environment variables exist, the scraper switches to API mode automatic
 - `REDDIT_CLIENT_SECRET`
 - `REDDIT_USER_AGENT`
 
-In API mode, the scraper uses PRAW as the primary source and can inspect top-level comments in addition to post content.
+PRAW mode captures:
 
-## Signals tracked
+- post rows
+- top-level comment rows where available
+- Reddit score data
+- comment text
 
-The scraper looks for three signal families:
+## Raw output columns
 
-- Continuation intent
-- Access pain
-- Platform friction
+`raw_discussions.csv` contains:
 
-It then ranks titles using:
+- `run_date`
+- `source`
+- `subreddit`
+- `query`
+- `post_title`
+- `post_body_or_summary`
+- `comment_text`
+- `url`
+- `score`
+- `num_comments`
+- `created_at`
+- `matched_keywords`
+- `fetch_mode`
+- `raw_id`
+- `needs_ai_review`
+- `notes`
 
-- `opportunity_score = continue_intent * access_pain`
-- `friction_weighted_score = continue_intent * (access_pain + platform_friction)`
+## Aggregate output columns
 
-Results are sorted by:
-
-1. `friction_weighted_score` descending
-2. `opportunity_score` descending
-3. `total_mentions` descending
-
-## Output columns
+`reddit_demand_data.csv` contains:
 
 - `title`
 - `source_type`
@@ -73,6 +119,7 @@ Results are sorted by:
 |       `-- reddit-scraper.yml
 |-- README.md
 |-- reddit_scraper.py
+|-- upload_to_google_sheets.py
 `-- requirements.txt
 ```
 
@@ -90,6 +137,7 @@ No credentials are required:
 
 ```bash
 python reddit_scraper.py
+python upload_to_google_sheets.py
 ```
 
 ### PRAW mode
@@ -114,29 +162,22 @@ set REDDIT_USER_AGENT=NovelBridgeResearch/0.1 by your_reddit_username
 python reddit_scraper.py
 ```
 
-For permanent variables on Windows:
+## GitHub secrets
 
-```powershell
-setx REDDIT_CLIENT_ID "your_client_id"
-setx REDDIT_CLIENT_SECRET "your_client_secret"
-setx REDDIT_USER_AGENT "NovelBridgeResearch/0.1 by your_reddit_username"
-```
+GitHub Actions supports both Reddit credentials and Google Sheets upload.
 
-Then restart the terminal before running the scraper again.
-
-## Add GitHub secrets later
-
-GitHub Secrets are optional. The workflow runs in RSS mode when they are missing.
-
-If you want API mode later, add these repository secrets:
+Optional Reddit API secrets:
 
 - `REDDIT_CLIENT_ID`
 - `REDDIT_CLIENT_SECRET`
 - `REDDIT_USER_AGENT`
 
-Path in GitHub:
+Required Google Sheets secrets:
 
-`Settings` -> `Secrets and variables` -> `Actions` -> `New repository secret`
+- `GOOGLE_SHEET_ID`
+- `GOOGLE_SERVICE_ACCOUNT_JSON`
+
+No secrets are hardcoded in the repository.
 
 ## GitHub Actions automation
 
@@ -155,7 +196,19 @@ Each workflow run:
 2. Sets up Python 3.13
 3. Installs dependencies
 4. Runs `python reddit_scraper.py`
-5. Uploads `reddit_demand_data.csv` as the `reddit-demand-data` artifact
+5. Runs `python upload_to_google_sheets.py`
+6. Uploads `raw_discussions.csv` as a GitHub artifact
+7. Uploads `reddit_demand_data.csv` as a GitHub artifact when present
+
+## How the Google Sheets upload works
+
+`upload_to_google_sheets.py` does the following:
+
+- appends `raw_discussions.csv` rows into `Raw_Discussions`
+- refreshes `Latest` with `reddit_demand_data.csv` when that file exists
+- appends aggregate rows into `History` when that file exists
+
+The raw discussion upload is append-only so Phase 1 history is preserved.
 
 ## How to manually run the workflow
 
@@ -164,37 +217,30 @@ Each workflow run:
 3. Select `Novel Bridge Reddit Scraper`
 4. Click `Run workflow`
 5. Open the completed run
-6. Download the `reddit-demand-data` artifact
+6. Check the workflow logs for:
+   - total raw discussions collected
+   - rows appended to `Raw_Discussions`
+   - whether aggregate CSV was produced
+7. Download the artifacts:
+   - `raw-discussions-data`
+   - `reddit-demand-data` when available
 
 ## RSS mode limitations
 
 - RSS mode does not fetch Reddit comments
-- RSS mode does not provide reliable upvote counts, so `total_upvotes` stays `0`
-- RSS results can be less complete than API results
+- RSS mode does not provide reliable upvote counts
 - RSS search quality can vary by subreddit and keyword
+- RSS mode is best treated as a broad raw intake layer
 
 ## API mode benefits
 
-- PRAW mode can inspect post bodies and top-level comments
-- PRAW mode can capture Reddit scores
-- PRAW mode is more flexible for future enrichment and filtering
-
-## Reddit API credentials
-
-To prepare for API mode:
-
-1. Go to [reddit.com/prefs/apps](https://www.reddit.com/prefs/apps)
-2. Click `create app` or `create another app`
-3. Choose the app type `script`
-4. Use a redirect URI such as `http://localhost:8080`
-5. Save the app
-6. Copy:
-   - `client_id`
-   - `client_secret`
-   - a user agent string such as `NovelBridgeResearch/0.1 by your_reddit_username`
+- PRAW mode includes top-level comments
+- PRAW mode captures Reddit scores
+- PRAW mode provides richer raw intake for AI review
 
 ## Notes
 
-- The scraper uses lightweight heuristics for title extraction.
-- The pipeline is intended for market research rather than production warehousing.
-- The script always writes `reddit_demand_data.csv`, even when no qualifying rows are found.
+- `Raw_Discussions` is the source of truth for Phase 1.
+- `AI_Review` is intended for manual or ChatGPT-assisted classification.
+- `Title_Opportunities` is intended for final opportunity decisions.
+- The aggregate CSV remains useful, but it is now downstream of raw intake rather than the primary dataset.

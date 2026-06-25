@@ -3,14 +3,11 @@
 """
 Novel Bridge Reddit Demand Scraper
 
-Default mode:
-- RSS/API-free mode using Reddit search RSS feeds
+Phase 1 output:
+- raw_discussions.csv as the source-of-truth raw discussion log
 
-Optional mode:
-- Reddit API mode using PRAW when REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET exist
-
-Output:
-- reddit_demand_data.csv
+Backward-compatible output:
+- reddit_demand_data.csv aggregated from raw discussions when possible
 """
 
 from __future__ import annotations
@@ -24,6 +21,7 @@ import time
 import traceback
 from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Set
 
 import feedparser
@@ -94,29 +92,65 @@ KEYWORD_GROUPS = {
 
 SEARCH_LIMIT_PER_KEYWORD = 100
 COMMENT_LIMIT_PER_POST = 50
-OUTPUT_FILENAME = "reddit_demand_data.csv"
+RAW_OUTPUT_FILENAME = "raw_discussions.csv"
+AGGREGATE_OUTPUT_FILENAME = "reddit_demand_data.csv"
 TOP_N = 100
 SLEEP_BETWEEN_REQUESTS_SECONDS = 0.5
 SLEEP_ON_ERROR_SECONDS = 2.0
 MAX_RETRIES = 3
 REQUEST_TIMEOUT_SECONDS = 30
-OUTPUT_PATH = Path(__file__).resolve().with_name(OUTPUT_FILENAME)
+RAW_OUTPUT_PATH = Path(__file__).resolve().with_name(RAW_OUTPUT_FILENAME)
+AGGREGATE_OUTPUT_PATH = Path(__file__).resolve().with_name(AGGREGATE_OUTPUT_FILENAME)
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/126.0 Safari/537.36 NovelBridgeResearch/0.1"
 )
 
+RAW_DISCUSSION_FIELDS = [
+    "run_date",
+    "source",
+    "subreddit",
+    "query",
+    "post_title",
+    "post_body_or_summary",
+    "comment_text",
+    "url",
+    "score",
+    "num_comments",
+    "created_at",
+    "matched_keywords",
+    "fetch_mode",
+    "raw_id",
+    "needs_ai_review",
+    "notes",
+]
+
+AGGREGATE_FIELDS = [
+    "title",
+    "source_type",
+    "origin_market",
+    "continue_intent",
+    "access_pain",
+    "platform_friction",
+    "total_mentions",
+    "total_upvotes",
+    "subreddits_found",
+    "sample_quotes",
+    "opportunity_score",
+    "friction_weighted_score",
+]
+
 TEXT_NORMALIZATION_REPLACEMENTS = {
+    "ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ": '"',
+    "ÃƒÂ¢Ã¢â€šÂ¬\x9d": '"',
+    "ÃƒÂ¢Ã¢â€šÂ¬Ã‹Å“": "'",
+    "ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢": "'",
+    "ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦": "...",
     "Ã¢â‚¬Å“": '"',
     "Ã¢â‚¬\x9d": '"',
     "Ã¢â‚¬Ëœ": "'",
     "Ã¢â‚¬â„¢": "'",
-    "Ã¢â‚¬Â¦": "...",
-    "â€œ": '"',
-    "â€\x9d": '"',
-    "â€˜": "'",
-    "â€™": "'",
 }
 
 ALIAS_MAP = {
@@ -255,20 +289,43 @@ SOURCE_TYPE_HINTS = {
 
 
 @dataclass
-class RawSignal:
-    title: str
+class RawDiscussion:
+    run_date: str
+    source: str
     subreddit: str
-    source_type: str
-    origin_market: str
-    continue_intent: int
-    access_pain: int
-    platform_friction: int
-    upvotes: int
-    quote: str
-    reddit_id: str
-    permalink: str
-    keyword: str = ""
-    published_at: str = ""
+    query: str
+    post_title: str
+    post_body_or_summary: str
+    comment_text: str
+    url: str
+    score: int
+    num_comments: int
+    created_at: str
+    matched_keywords: str
+    fetch_mode: str
+    raw_id: str
+    needs_ai_review: str = "TRUE"
+    notes: str = ""
+
+    def to_row(self) -> Dict[str, Any]:
+        return {
+            "run_date": self.run_date,
+            "source": self.source,
+            "subreddit": self.subreddit,
+            "query": self.query,
+            "post_title": self.post_title,
+            "post_body_or_summary": self.post_body_or_summary,
+            "comment_text": self.comment_text,
+            "url": self.url,
+            "score": self.score,
+            "num_comments": self.num_comments,
+            "created_at": self.created_at,
+            "matched_keywords": self.matched_keywords,
+            "fetch_mode": self.fetch_mode,
+            "raw_id": self.raw_id,
+            "needs_ai_review": self.needs_ai_review,
+            "notes": self.notes,
+        }
 
 
 @dataclass
@@ -318,8 +375,16 @@ class RSSRateLimitedError(RuntimeError):
 # =============================================================================
 
 
+def utc_run_date() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
 def normalize_space(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
+
+
+def clean_identifier(text: str) -> str:
+    return normalize_space(str(text or ""))
 
 
 def clean_text(text: str) -> str:
@@ -437,6 +502,44 @@ def all_keywords() -> List[str]:
             if keyword not in seen:
                 seen.append(keyword)
     return seen
+
+
+def get_matched_keywords(text: str, query: str = "") -> List[str]:
+    low = clean_text(text).lower()
+    matches: List[str] = []
+
+    for pairs in COMPILED_KEYWORDS.values():
+        for keyword, pattern in pairs:
+            if pattern.search(low) and keyword not in matches:
+                matches.append(keyword)
+
+    if query and query not in matches:
+        matches.append(query)
+
+    return matches
+
+
+def format_matched_keywords(text: str, query: str = "") -> str:
+    matches = get_matched_keywords(text, query)
+    return " | ".join(matches)
+
+
+def format_created_at(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value), timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    text = normalize_space(str(value))
+    if not text:
+        return ""
+
+    try:
+        numeric = float(text)
+    except ValueError:
+        return text
+    return datetime.fromtimestamp(numeric, timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 # =============================================================================
@@ -607,15 +710,16 @@ def select_source() -> SourceConfig:
 # =============================================================================
 
 
-def scrape_subreddit(subreddit_name: str, source: SourceConfig) -> List[RawSignal]:
+def scrape_subreddit(subreddit_name: str, source: SourceConfig, run_date: str) -> List[RawDiscussion]:
     if source.mode == "praw":
-        return scrape_subreddit_praw(source.reddit, subreddit_name)
-    return scrape_subreddit_rss(source.session, subreddit_name)
+        return scrape_subreddit_praw(source.reddit, subreddit_name, run_date)
+    return scrape_subreddit_rss(source.session, subreddit_name, run_date)
 
 
-def scrape_subreddit_praw(reddit: Any, subreddit_name: str) -> List[RawSignal]:
-    rows: List[RawSignal] = []
+def scrape_subreddit_praw(reddit: Any, subreddit_name: str, run_date: str) -> List[RawDiscussion]:
+    rows: List[RawDiscussion] = []
     seen_submission_ids: Set[str] = set()
+    seen_comment_ids: Set[str] = set()
     subreddit = reddit.subreddit(subreddit_name)
     keywords = all_keywords()
 
@@ -634,11 +738,12 @@ def scrape_subreddit_praw(reddit: Any, subreddit_name: str) -> List[RawSignal]:
                 )
 
                 for submission in submissions:
-                    submission_id = str(getattr(submission, "id", "") or "")
+                    submission_id = clean_identifier(getattr(submission, "id", "") or "")
                     if not submission_id or submission_id in seen_submission_ids:
                         continue
+
                     seen_submission_ids.add(submission_id)
-                    rows.extend(process_praw_submission(subreddit_name, submission, keyword))
+                    rows.extend(process_praw_submission(subreddit_name, submission, keyword, run_date, seen_comment_ids))
 
                 time.sleep(SLEEP_BETWEEN_REQUESTS_SECONDS)
                 break
@@ -648,43 +753,46 @@ def scrape_subreddit_praw(reddit: Any, subreddit_name: str) -> List[RawSignal]:
                     traceback.print_exc()
                 time.sleep(SLEEP_ON_ERROR_SECONDS * attempt)
 
-    print(f"  [DONE] r/{subreddit_name}: {len(rows)} raw signal rows")
+    print(f"  [DONE] r/{subreddit_name}: {len(rows)} raw discussion rows")
     return rows
 
 
-def process_praw_submission(subreddit_name: str, submission: Any, keyword: str) -> List[RawSignal]:
-    rows: List[RawSignal] = []
+def process_praw_submission(
+    subreddit_name: str,
+    submission: Any,
+    keyword: str,
+    run_date: str,
+    seen_comment_ids: Set[str],
+) -> List[RawDiscussion]:
+    rows: List[RawDiscussion] = []
 
     title_text = clean_text(getattr(submission, "title", "") or "")
     self_text = clean_text(getattr(submission, "selftext", "") or "")
     permalink = f"https://www.reddit.com{getattr(submission, 'permalink', '')}"
     upvotes = int(getattr(submission, "score", 0) or 0)
     num_comments = int(getattr(submission, "num_comments", 0) or 0)
-    reddit_id = str(getattr(submission, "id", "") or "")
-    published_at = str(getattr(submission, "created_utc", "") or "")
-
+    reddit_id = clean_identifier(getattr(submission, "id", "") or "")
+    created_at = format_created_at(getattr(submission, "created_utc", "") or "")
     combined_post_text = f"{title_text}\n{self_text}".strip()
-    title = extract_title_from_submission(subreddit_name, title_text, self_text)
-    post_signals = classify_intent(combined_post_text)
 
-    if title and sum(post_signals.values()) > 0:
-        rows.append(
-            RawSignal(
-                title=title,
-                subreddit=subreddit_name,
-                source_type=infer_source_type(combined_post_text, subreddit_name),
-                origin_market=infer_origin_market(combined_post_text, subreddit_name),
-                continue_intent=post_signals["continue_intent"],
-                access_pain=post_signals["access_pain"],
-                platform_friction=post_signals["platform_friction"],
-                upvotes=upvotes,
-                quote=truncate_quote(combined_post_text),
-                reddit_id=reddit_id,
-                permalink=permalink,
-                keyword=keyword,
-                published_at=published_at,
-            )
+    rows.append(
+        RawDiscussion(
+            run_date=run_date,
+            source="reddit",
+            subreddit=subreddit_name,
+            query=keyword,
+            post_title=title_text,
+            post_body_or_summary=self_text,
+            comment_text="",
+            url=permalink,
+            score=upvotes,
+            num_comments=num_comments,
+            created_at=created_at,
+            matched_keywords=format_matched_keywords(combined_post_text, keyword),
+            fetch_mode="praw",
+            raw_id=reddit_id,
         )
+    )
 
     try:
         submission.comments.replace_more(limit=0)
@@ -694,44 +802,48 @@ def process_praw_submission(subreddit_name: str, submission: Any, keyword: str) 
         comments = []
 
     for comment in comments:
-        body = clean_text(getattr(comment, "body", "") or "")
-        if not body:
+        comment_id = clean_identifier(getattr(comment, "id", "") or "")
+        if not comment_id or comment_id in seen_comment_ids:
+            continue
+        seen_comment_ids.add(comment_id)
+
+        comment_text = clean_text(getattr(comment, "body", "") or "")
+        if not comment_text:
             continue
 
-        signals = classify_intent(body)
-        if sum(signals.values()) == 0:
-            continue
-
-        comment_title = extract_title(body) or title
-        if not comment_title:
-            continue
+        comment_url = getattr(comment, "permalink", "")
+        if comment_url:
+            comment_url = f"https://www.reddit.com{comment_url}"
+        else:
+            comment_url = permalink
 
         rows.append(
-            RawSignal(
-                title=comment_title,
+            RawDiscussion(
+                run_date=run_date,
+                source="reddit",
                 subreddit=subreddit_name,
-                source_type=infer_source_type(body + " " + combined_post_text, subreddit_name),
-                origin_market=infer_origin_market(body + " " + combined_post_text, subreddit_name),
-                continue_intent=signals["continue_intent"],
-                access_pain=signals["access_pain"],
-                platform_friction=signals["platform_friction"],
-                upvotes=int(getattr(comment, "score", 0) or 0),
-                quote=truncate_quote(body),
-                reddit_id=str(getattr(comment, "id", "") or ""),
-                permalink=permalink,
-                keyword=keyword,
-                published_at=published_at,
+                query=keyword,
+                post_title=title_text,
+                post_body_or_summary=self_text,
+                comment_text=comment_text,
+                url=comment_url,
+                score=int(getattr(comment, "score", 0) or 0),
+                num_comments=0,
+                created_at=format_created_at(getattr(comment, "created_utc", "") or ""),
+                matched_keywords=format_matched_keywords(f"{comment_text}\n{combined_post_text}", keyword),
+                fetch_mode="praw",
+                raw_id=comment_id,
             )
         )
 
     return rows
 
 
-def scrape_subreddit_rss(session: Optional[requests.Session], subreddit_name: str) -> List[RawSignal]:
+def scrape_subreddit_rss(session: Optional[requests.Session], subreddit_name: str, run_date: str) -> List[RawDiscussion]:
     if session is None:
         raise RuntimeError("RSS mode requires a requests session.")
 
-    rows: List[RawSignal] = []
+    rows: List[RawDiscussion] = []
     seen_entry_ids: Set[str] = set()
     keywords = all_keywords()
 
@@ -747,7 +859,7 @@ def scrape_subreddit_rss(session: Optional[requests.Session], subreddit_name: st
             break
 
         for entry in feed.entries[:SEARCH_LIMIT_PER_KEYWORD]:
-            entry_id = clean_text(getattr(entry, "id", "") or getattr(entry, "link", "") or "")
+            entry_id = clean_identifier(getattr(entry, "id", "") or getattr(entry, "link", "") or "")
             if not entry_id or entry_id in seen_entry_ids:
                 continue
             seen_entry_ids.add(entry_id)
@@ -756,33 +868,31 @@ def scrape_subreddit_rss(session: Optional[requests.Session], subreddit_name: st
             summary_html = get_feed_entry_summary_html(entry)
             summary_text = strip_html(summary_html)
             combined = f"{title_text}\n{summary_text}".strip()
-            signals = classify_intent(combined)
-            title = extract_title_from_submission(subreddit_name, title_text, summary_text)
-
-            if not title or sum(signals.values()) == 0:
-                continue
 
             rows.append(
-                RawSignal(
-                    title=title,
+                RawDiscussion(
+                    run_date=run_date,
+                    source="reddit",
                     subreddit=subreddit_name,
-                    source_type=infer_source_type(combined, subreddit_name),
-                    origin_market=infer_origin_market(combined, subreddit_name),
-                    continue_intent=signals["continue_intent"],
-                    access_pain=signals["access_pain"],
-                    platform_friction=signals["platform_friction"],
-                    upvotes=0,
-                    quote=truncate_quote(combined),
-                    reddit_id=entry_id,
-                    permalink=clean_text(getattr(entry, "link", "") or ""),
-                    keyword=keyword,
-                    published_at=clean_text(getattr(entry, "published", "") or getattr(entry, "updated", "") or ""),
+                    query=keyword,
+                    post_title=title_text,
+                    post_body_or_summary=summary_text,
+                    comment_text="",
+                    url=clean_identifier(getattr(entry, "link", "") or ""),
+                    score=0,
+                    num_comments=0,
+                    created_at=format_created_at(
+                        clean_text(getattr(entry, "published", "") or getattr(entry, "updated", "") or "")
+                    ),
+                    matched_keywords=format_matched_keywords(combined, keyword),
+                    fetch_mode="rss",
+                    raw_id=entry_id,
                 )
             )
 
         time.sleep(SLEEP_BETWEEN_REQUESTS_SECONDS)
 
-    print(f"  [DONE] r/{subreddit_name}: {len(rows)} raw signal rows")
+    print(f"  [DONE] r/{subreddit_name}: {len(rows)} raw discussion rows")
     return rows
 
 
@@ -832,35 +942,54 @@ def get_feed_entry_summary_html(entry: Any) -> str:
 
 
 # =============================================================================
-# AGGREGATION / SCORING / EXPORT
+# AGGREGATION / EXPORT
 # =============================================================================
 
 
-def aggregate_by_title(raw_data: Sequence[RawSignal]) -> Dict[str, AggregateSignal]:
+def discussion_text_for_analysis(row: RawDiscussion) -> str:
+    parts = [row.post_title, row.post_body_or_summary, row.comment_text]
+    return "\n".join(part for part in parts if part).strip()
+
+
+def discussion_title_for_analysis(row: RawDiscussion) -> Optional[str]:
+    if row.comment_text:
+        comment_title = extract_title(row.comment_text)
+        if comment_title:
+            return comment_title
+    return extract_title_from_submission(row.subreddit, row.post_title, row.post_body_or_summary)
+
+
+def aggregate_by_title(raw_data: Sequence[RawDiscussion]) -> Dict[str, AggregateSignal]:
     aggregated: Dict[str, AggregateSignal] = {}
 
     for row in raw_data:
-        title = normalize_title(row.title)
-        if is_junk_title(title):
+        text = discussion_text_for_analysis(row)
+        title = discussion_title_for_analysis(row)
+        signals = classify_intent(text)
+
+        if not title or is_junk_title(title):
+            continue
+
+        if signals["continue_intent"] == 0 and signals["access_pain"] == 0 and signals["platform_friction"] == 0:
             continue
 
         if title not in aggregated:
             aggregated[title] = AggregateSignal(title=title)
 
         aggregate = aggregated[title]
-        aggregate.continue_intent += row.continue_intent
-        aggregate.access_pain += row.access_pain
-        aggregate.platform_friction += row.platform_friction
+        aggregate.continue_intent += signals["continue_intent"]
+        aggregate.access_pain += signals["access_pain"]
+        aggregate.platform_friction += signals["platform_friction"]
         aggregate.total_mentions += 1
-        aggregate.total_upvotes += max(0, row.upvotes)
+        aggregate.total_upvotes += max(0, row.score)
         aggregate.subreddits_found.add(row.subreddit)
-        aggregate.source_type_counts[row.source_type] += 1
-        aggregate.origin_market_counts[row.origin_market] += 1
+        aggregate.source_type_counts[infer_source_type(text, row.subreddit)] += 1
+        aggregate.origin_market_counts[infer_origin_market(text, row.subreddit)] += 1
 
-        if row.quote and len(aggregate.sample_quotes) < 5:
-            quote = row.quote.replace("\n", " ").strip()
-            if quote not in aggregate.sample_quotes:
-                aggregate.sample_quotes.append(quote)
+        quote_source = row.comment_text or row.post_body_or_summary or row.post_title
+        quote = truncate_quote(quote_source)
+        if quote and len(aggregate.sample_quotes) < 5 and quote not in aggregate.sample_quotes:
+            aggregate.sample_quotes.append(quote)
 
     return aggregated
 
@@ -869,9 +998,6 @@ def calculate_scores(aggregated: Dict[str, AggregateSignal]) -> List[Dict[str, A
     rows: List[Dict[str, Any]] = []
 
     for title, aggregate in aggregated.items():
-        if aggregate.continue_intent == 0 and aggregate.access_pain == 0 and aggregate.platform_friction == 0:
-            continue
-
         rows.append(
             {
                 "title": title,
@@ -900,29 +1026,24 @@ def calculate_scores(aggregated: Dict[str, AggregateSignal]) -> List[Dict[str, A
     return rows[:TOP_N]
 
 
-def export_csv(data: Sequence[Dict[str, Any]], filename: str) -> None:
-    fieldnames = [
-        "title",
-        "source_type",
-        "origin_market",
-        "continue_intent",
-        "access_pain",
-        "platform_friction",
-        "total_mentions",
-        "total_upvotes",
-        "subreddits_found",
-        "sample_quotes",
-        "opportunity_score",
-        "friction_weighted_score",
-    ]
-
+def export_raw_discussions(data: Sequence[RawDiscussion], filename: str) -> None:
     with open(filename, "w", newline="", encoding="utf-8-sig") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer = csv.DictWriter(handle, fieldnames=RAW_DISCUSSION_FIELDS)
+        writer.writeheader()
+        for row in data:
+            writer.writerow(row.to_row())
+
+    print(f"\n[EXPORT] Wrote {len(data)} raw discussion rows to {filename}")
+
+
+def export_aggregate_csv(data: Sequence[Dict[str, Any]], filename: str) -> None:
+    with open(filename, "w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=AGGREGATE_FIELDS)
         writer.writeheader()
         for row in data:
             writer.writerow(row)
 
-    print(f"\n[EXPORT] Wrote {len(data)} rows to {filename}")
+    print(f"[EXPORT] Wrote {len(data)} aggregate rows to {filename}")
 
 
 # =============================================================================
@@ -934,13 +1055,16 @@ def main() -> None:
     print("=" * 80)
     print("Novel Bridge Reddit Demand Scraper")
     print("=" * 80)
+    print("Phase 1 mode: collect raw discussion rows first")
     print(f"Subreddits: {len(SUBREDDITS)}")
     print(f"Keywords: {len(all_keywords())}")
     print(f"Search limit: {SEARCH_LIMIT_PER_KEYWORD} posts per keyword per subreddit")
     print(f"Comment limit: {COMMENT_LIMIT_PER_POST} top-level comments per post")
     print("=" * 80)
 
-    all_raw_rows: List[RawSignal] = []
+    run_date = utc_run_date()
+    all_raw_rows: List[RawDiscussion] = []
+    aggregate_produced = False
 
     try:
         source = select_source()
@@ -948,7 +1072,7 @@ def main() -> None:
         for index, subreddit_name in enumerate(SUBREDDITS, start=1):
             print(f"\n[{index}/{len(SUBREDDITS)}] Starting r/{subreddit_name}")
             try:
-                rows = scrape_subreddit(subreddit_name, source)
+                rows = scrape_subreddit(subreddit_name, source, run_date)
                 all_raw_rows.extend(rows)
             except KeyboardInterrupt:
                 print("\n[STOPPED] KeyboardInterrupt received. Exporting partial results...")
@@ -964,25 +1088,30 @@ def main() -> None:
         traceback.print_exc()
     finally:
         print("\n" + "=" * 80)
-        print(f"Raw signal rows collected: {len(all_raw_rows)}")
+        print(f"Total raw discussions collected: {len(all_raw_rows)}")
+
+        export_raw_discussions(all_raw_rows, str(RAW_OUTPUT_PATH))
 
         aggregated = aggregate_by_title(all_raw_rows)
         print(f"Aggregated titles: {len(aggregated)}")
 
         scored = calculate_scores(aggregated)
-        print(f"Final top rows: {len(scored)}")
+        export_aggregate_csv(scored, str(AGGREGATE_OUTPUT_PATH))
+        aggregate_produced = True
 
-        export_csv(scored, str(OUTPUT_PATH))
+        print(f"Aggregate CSV produced: {'yes' if aggregate_produced else 'no'}")
+        print(f"Aggregate top rows: {len(scored)}")
 
-        print("\nTop 10 preview:")
-        for row in scored[:10]:
-            print(
-                f"- {row['title']} | "
-                f"continue={row['continue_intent']} "
-                f"access={row['access_pain']} "
-                f"platform={row['platform_friction']} "
-                f"score={row['friction_weighted_score']}"
-            )
+        if scored:
+            print("\nTop 10 preview:")
+            for row in scored[:10]:
+                print(
+                    f"- {row['title']} | "
+                    f"continue={row['continue_intent']} "
+                    f"access={row['access_pain']} "
+                    f"platform={row['platform_friction']} "
+                    f"score={row['friction_weighted_score']}"
+                )
 
         print("\nDone.")
 
