@@ -90,6 +90,7 @@ PRAW mode captures:
 - `matched_keywords`
 - `fetch_mode`
 - `raw_id`
+- `title_candidate`
 - `needs_ai_review`
 - `notes`
 
@@ -218,7 +219,10 @@ The raw discussion upload is append-only so Phase 1 history is preserved.
 4. Click `Run workflow`
 5. Open the completed run
 6. Check the workflow logs for:
+   - total queries attempted
+   - RSS entries fetched
    - total raw discussions collected
+   - unique raw rows written
    - rows appended to `Raw_Discussions`
    - whether aggregate CSV was produced
 7. Download the artifacts:
@@ -241,6 +245,7 @@ The raw discussion upload is append-only so Phase 1 history is preserved.
 ## Notes
 
 - `Raw_Discussions` is the source of truth for Phase 1.
+- The scraper stores raw rows even when title extraction is uncertain; `title_candidate` can be blank and `needs_ai_review` defaults to `TRUE`.
 - `AI_Review` is intended for manual or ChatGPT-assisted classification.
 - `Title_Opportunities` is intended for final opportunity decisions.
 - The aggregate CSV remains useful, but it is now downstream of raw intake rather than the primary dataset.

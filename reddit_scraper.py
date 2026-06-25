@@ -49,44 +49,61 @@ SUBREDDITS = [
 KEYWORD_GROUPS = {
     "continue_intent": [
         "where to continue",
-        "what chapter after anime",
         "continue after anime",
         "continue after manga",
-        "where to start novel",
-        "what volume after anime",
-        "what chapter after season",
-        "read the original novel",
-        "novel ahead of anime",
+        "continue after manhwa",
+        "after anime",
+        "after season",
+        "after episode",
+        "what chapter",
+        "which chapter",
+        "what volume",
+        "where to start",
+        "start after anime",
+        "pick up after anime",
+        "read after anime",
+        "novel ahead",
+        "manga ahead",
+        "manhwa ahead",
+        "web novel ahead",
     ],
     "access_pain": [
-        "no english translation",
         "where to read",
-        "can't find raw",
-        "cant find raw",
-        "cannot find raw",
-        "only in korean",
-        "only in japanese",
-        "only in chinese",
-        "no official release",
-        "licensed nowhere",
+        "where can I read",
+        "official translation",
+        "english translation",
+        "no english translation",
+        "no official translation",
+        "official release",
+        "licensed",
+        "licensed where",
+        "raw",
+        "raws",
+        "raw chapters",
+        "korean raw",
+        "japanese raw",
+        "chinese raw",
+        "mtl",
+        "machine translation",
         "unavailable",
-        "unreadable mtl",
-        "only available on",
+        "can't find",
+        "cannot find",
     ],
     "platform_friction": [
+        "naver",
         "naver series",
         "kakao page",
         "kakaopage",
         "ridibooks",
         "ridi",
         "syosetu",
-        "shousetsuka ni narou",
         "kakuyomu",
         "pixiv novel",
-        "jjwxc",
         "qidian",
+        "jjwxc",
         "bilibili comics",
         "bookwalker",
+        "bookwalker jp",
     ],
 }
 
@@ -122,6 +139,7 @@ RAW_DISCUSSION_FIELDS = [
     "matched_keywords",
     "fetch_mode",
     "raw_id",
+    "title_candidate",
     "needs_ai_review",
     "notes",
 ]
@@ -304,6 +322,7 @@ class RawDiscussion:
     matched_keywords: str
     fetch_mode: str
     raw_id: str
+    title_candidate: str = ""
     needs_ai_review: str = "TRUE"
     notes: str = ""
 
@@ -323,6 +342,7 @@ class RawDiscussion:
             "matched_keywords": self.matched_keywords,
             "fetch_mode": self.fetch_mode,
             "raw_id": self.raw_id,
+            "title_candidate": self.title_candidate,
             "needs_ai_review": self.needs_ai_review,
             "notes": self.notes,
         }
@@ -364,6 +384,14 @@ class SourceConfig:
     user_agent: str
     reddit: Any = None
     session: Optional[requests.Session] = None
+
+
+@dataclass
+class ScrapeStats:
+    query_attempts: int = 0
+    rss_entries_fetched: int = 0
+    unique_raw_rows: int = 0
+    aggregate_rows_written: int = 0
 
 
 class RSSRateLimitedError(RuntimeError):
@@ -504,6 +532,21 @@ def all_keywords() -> List[str]:
     return seen
 
 
+def build_search_queries() -> List[str]:
+    queries: List[str] = []
+
+    for keyword in all_keywords():
+        if keyword not in queries:
+            queries.append(keyword)
+
+        for suffix in ("novel", "manga", "manhwa"):
+            expanded = keyword if re.search(rf"\b{re.escape(suffix)}\b", keyword, flags=re.IGNORECASE) else f"{keyword} {suffix}"
+            if expanded not in queries:
+                queries.append(expanded)
+
+    return queries
+
+
 def get_matched_keywords(text: str, query: str = "") -> List[str]:
     low = clean_text(text).lower()
     matches: List[str] = []
@@ -540,6 +583,13 @@ def format_created_at(value: Any) -> str:
     except ValueError:
         return text
     return datetime.fromtimestamp(numeric, timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def build_row_key(raw_id: str, url: str) -> str:
+    raw_id = clean_identifier(raw_id)
+    if raw_id:
+        return raw_id
+    return clean_identifier(url)
 
 
 # =============================================================================
@@ -665,6 +715,24 @@ def extract_title_from_submission(subreddit_name: str, submission_title: str, su
     return extract_title(combined)
 
 
+def guess_title_candidate(
+    subreddit_name: str,
+    submission_title: str,
+    submission_text: str = "",
+    comment_text: str = "",
+) -> str:
+    if comment_text:
+        comment_title = extract_title(comment_text)
+        if comment_title and not is_junk_title(comment_title):
+            return comment_title
+
+    title = extract_title_from_submission(subreddit_name, submission_title, submission_text)
+    if title and not is_junk_title(title):
+        return title
+
+    return ""
+
+
 # =============================================================================
 # SOURCE SELECTION
 # =============================================================================
@@ -710,23 +778,25 @@ def select_source() -> SourceConfig:
 # =============================================================================
 
 
-def scrape_subreddit(subreddit_name: str, source: SourceConfig, run_date: str) -> List[RawDiscussion]:
+def scrape_subreddit(subreddit_name: str, source: SourceConfig, run_date: str, stats: ScrapeStats) -> List[RawDiscussion]:
     if source.mode == "praw":
-        return scrape_subreddit_praw(source.reddit, subreddit_name, run_date)
-    return scrape_subreddit_rss(source.session, subreddit_name, run_date)
+        return scrape_subreddit_praw(source.reddit, subreddit_name, run_date, stats)
+    return scrape_subreddit_rss(source.session, subreddit_name, run_date, stats)
 
 
-def scrape_subreddit_praw(reddit: Any, subreddit_name: str, run_date: str) -> List[RawDiscussion]:
+def scrape_subreddit_praw(reddit: Any, subreddit_name: str, run_date: str, stats: ScrapeStats) -> List[RawDiscussion]:
     rows: List[RawDiscussion] = []
+    seen_row_keys: Set[str] = set()
     seen_submission_ids: Set[str] = set()
     seen_comment_ids: Set[str] = set()
     subreddit = reddit.subreddit(subreddit_name)
-    keywords = all_keywords()
+    keywords = build_search_queries()
 
     print(f"\n[SUBREDDIT PRAW] r/{subreddit_name}")
 
     for index, keyword in enumerate(keywords, start=1):
         print(f"  [{index}/{len(keywords)}] Searching keyword: {keyword!r}")
+        stats.query_attempts += 1
 
         for attempt in range(1, MAX_RETRIES + 1):
             try:
@@ -743,7 +813,16 @@ def scrape_subreddit_praw(reddit: Any, subreddit_name: str, run_date: str) -> Li
                         continue
 
                     seen_submission_ids.add(submission_id)
-                    rows.extend(process_praw_submission(subreddit_name, submission, keyword, run_date, seen_comment_ids))
+                    rows.extend(
+                        process_praw_submission(
+                            subreddit_name,
+                            submission,
+                            keyword,
+                            run_date,
+                            seen_comment_ids,
+                            seen_row_keys,
+                        )
+                    )
 
                 time.sleep(SLEEP_BETWEEN_REQUESTS_SECONDS)
                 break
@@ -763,6 +842,7 @@ def process_praw_submission(
     keyword: str,
     run_date: str,
     seen_comment_ids: Set[str],
+    seen_row_keys: Set[str],
 ) -> List[RawDiscussion]:
     rows: List[RawDiscussion] = []
 
@@ -774,25 +854,30 @@ def process_praw_submission(
     reddit_id = clean_identifier(getattr(submission, "id", "") or "")
     created_at = format_created_at(getattr(submission, "created_utc", "") or "")
     combined_post_text = f"{title_text}\n{self_text}".strip()
+    submission_title_candidate = guess_title_candidate(subreddit_name, title_text, self_text)
 
-    rows.append(
-        RawDiscussion(
-            run_date=run_date,
-            source="reddit",
-            subreddit=subreddit_name,
-            query=keyword,
-            post_title=title_text,
-            post_body_or_summary=self_text,
-            comment_text="",
-            url=permalink,
-            score=upvotes,
-            num_comments=num_comments,
-            created_at=created_at,
-            matched_keywords=format_matched_keywords(combined_post_text, keyword),
-            fetch_mode="praw",
-            raw_id=reddit_id,
+    submission_row_key = build_row_key(reddit_id, permalink)
+    if submission_row_key and submission_row_key not in seen_row_keys:
+        seen_row_keys.add(submission_row_key)
+        rows.append(
+            RawDiscussion(
+                run_date=run_date,
+                source="reddit",
+                subreddit=subreddit_name,
+                query=keyword,
+                post_title=title_text,
+                post_body_or_summary=self_text,
+                comment_text="",
+                url=permalink,
+                score=upvotes,
+                num_comments=num_comments,
+                created_at=created_at,
+                matched_keywords=format_matched_keywords(combined_post_text, keyword),
+                fetch_mode="praw",
+                raw_id=reddit_id,
+                title_candidate=submission_title_candidate,
+            )
         )
-    )
 
     try:
         submission.comments.replace_more(limit=0)
@@ -817,6 +902,11 @@ def process_praw_submission(
         else:
             comment_url = permalink
 
+        comment_row_key = build_row_key(comment_id, comment_url)
+        if not comment_row_key or comment_row_key in seen_row_keys:
+            continue
+
+        seen_row_keys.add(comment_row_key)
         rows.append(
             RawDiscussion(
                 run_date=run_date,
@@ -833,36 +923,49 @@ def process_praw_submission(
                 matched_keywords=format_matched_keywords(f"{comment_text}\n{combined_post_text}", keyword),
                 fetch_mode="praw",
                 raw_id=comment_id,
+                title_candidate=guess_title_candidate(subreddit_name, title_text, self_text, comment_text),
             )
         )
 
     return rows
 
 
-def scrape_subreddit_rss(session: Optional[requests.Session], subreddit_name: str, run_date: str) -> List[RawDiscussion]:
+def scrape_subreddit_rss(
+    session: Optional[requests.Session],
+    subreddit_name: str,
+    run_date: str,
+    stats: ScrapeStats,
+) -> List[RawDiscussion]:
     if session is None:
         raise RuntimeError("RSS mode requires a requests session.")
 
     rows: List[RawDiscussion] = []
-    seen_entry_ids: Set[str] = set()
-    keywords = all_keywords()
+    seen_row_keys: Set[str] = set()
+    keywords = build_search_queries()
 
     print(f"\n[SUBREDDIT RSS] r/{subreddit_name}")
 
     for index, keyword in enumerate(keywords, start=1):
         print(f"  [{index}/{len(keywords)}] Searching keyword: {keyword!r}")
+        stats.query_attempts += 1
         try:
             feed = fetch_rss_feed(session, subreddit_name, keyword)
         except RSSRateLimitedError as exc:
             print(f"    [WARN] {exc}")
-            print(f"    [WARN] Stopping RSS collection early for r/{subreddit_name}.")
-            break
+            print(f"    [WARN] Skipping query {keyword!r} and continuing with the remaining RSS queries.")
+            time.sleep(SLEEP_ON_ERROR_SECONDS * MAX_RETRIES)
+            continue
 
-        for entry in feed.entries[:SEARCH_LIMIT_PER_KEYWORD]:
+        entries = list(feed.entries[:SEARCH_LIMIT_PER_KEYWORD])
+        stats.rss_entries_fetched += len(entries)
+
+        for entry in entries:
             entry_id = clean_identifier(getattr(entry, "id", "") or getattr(entry, "link", "") or "")
-            if not entry_id or entry_id in seen_entry_ids:
+            entry_url = clean_identifier(getattr(entry, "link", "") or "")
+            row_key = build_row_key(entry_id, entry_url)
+            if not row_key or row_key in seen_row_keys:
                 continue
-            seen_entry_ids.add(entry_id)
+            seen_row_keys.add(row_key)
 
             title_text = clean_text(getattr(entry, "title", "") or "")
             summary_html = get_feed_entry_summary_html(entry)
@@ -878,7 +981,7 @@ def scrape_subreddit_rss(session: Optional[requests.Session], subreddit_name: st
                     post_title=title_text,
                     post_body_or_summary=summary_text,
                     comment_text="",
-                    url=clean_identifier(getattr(entry, "link", "") or ""),
+                    url=entry_url,
                     score=0,
                     num_comments=0,
                     created_at=format_created_at(
@@ -887,6 +990,7 @@ def scrape_subreddit_rss(session: Optional[requests.Session], subreddit_name: st
                     matched_keywords=format_matched_keywords(combined, keyword),
                     fetch_mode="rss",
                     raw_id=entry_id,
+                    title_candidate=guess_title_candidate(subreddit_name, title_text, summary_text),
                 )
             )
 
@@ -919,7 +1023,7 @@ def fetch_rss_feed(session: requests.Session, subreddit_name: str, keyword: str)
                 ) from exc
             if attempt == MAX_RETRIES:
                 break
-            time.sleep(SLEEP_ON_ERROR_SECONDS * attempt)
+            time.sleep(SLEEP_ON_ERROR_SECONDS * (2 ** (attempt - 1)))
         except Exception as exc:
             print(f"    [ERROR] RSS r/{subreddit_name} keyword={keyword!r} attempt={attempt}: {exc}")
             if attempt == MAX_RETRIES:
@@ -947,11 +1051,13 @@ def get_feed_entry_summary_html(entry: Any) -> str:
 
 
 def discussion_text_for_analysis(row: RawDiscussion) -> str:
-    parts = [row.post_title, row.post_body_or_summary, row.comment_text]
+    parts = [row.query, row.post_title, row.post_body_or_summary, row.comment_text]
     return "\n".join(part for part in parts if part).strip()
 
 
 def discussion_title_for_analysis(row: RawDiscussion) -> Optional[str]:
+    if row.title_candidate:
+        return normalize_title(row.title_candidate)
     if row.comment_text:
         comment_title = extract_title(row.comment_text)
         if comment_title:
@@ -1057,14 +1163,17 @@ def main() -> None:
     print("=" * 80)
     print("Phase 1 mode: collect raw discussion rows first")
     print(f"Subreddits: {len(SUBREDDITS)}")
-    print(f"Keywords: {len(all_keywords())}")
-    print(f"Search limit: {SEARCH_LIMIT_PER_KEYWORD} posts per keyword per subreddit")
+    print(f"Base queries: {len(all_keywords())}")
+    print(f"Expanded search queries: {len(build_search_queries())}")
+    print(f"Search limit: {SEARCH_LIMIT_PER_KEYWORD} posts per query per subreddit")
     print(f"Comment limit: {COMMENT_LIMIT_PER_POST} top-level comments per post")
     print("=" * 80)
 
     run_date = utc_run_date()
     all_raw_rows: List[RawDiscussion] = []
+    stats = ScrapeStats()
     aggregate_produced = False
+    AGGREGATE_OUTPUT_PATH.unlink(missing_ok=True)
 
     try:
         source = select_source()
@@ -1072,7 +1181,7 @@ def main() -> None:
         for index, subreddit_name in enumerate(SUBREDDITS, start=1):
             print(f"\n[{index}/{len(SUBREDDITS)}] Starting r/{subreddit_name}")
             try:
-                rows = scrape_subreddit(subreddit_name, source, run_date)
+                rows = scrape_subreddit(subreddit_name, source, run_date, stats)
                 all_raw_rows.extend(rows)
             except KeyboardInterrupt:
                 print("\n[STOPPED] KeyboardInterrupt received. Exporting partial results...")
@@ -1088,19 +1197,30 @@ def main() -> None:
         traceback.print_exc()
     finally:
         print("\n" + "=" * 80)
+        stats.unique_raw_rows = len(all_raw_rows)
+        print(f"Total queries attempted: {stats.query_attempts}")
+        print(f"RSS entries fetched: {stats.rss_entries_fetched}")
         print(f"Total raw discussions collected: {len(all_raw_rows)}")
+        print(f"Unique raw rows written: {stats.unique_raw_rows}")
 
         export_raw_discussions(all_raw_rows, str(RAW_OUTPUT_PATH))
 
-        aggregated = aggregate_by_title(all_raw_rows)
-        print(f"Aggregated titles: {len(aggregated)}")
+        scored: List[Dict[str, Any]] = []
+        try:
+            aggregated = aggregate_by_title(all_raw_rows)
+            print(f"Aggregated titles: {len(aggregated)}")
 
-        scored = calculate_scores(aggregated)
-        export_aggregate_csv(scored, str(AGGREGATE_OUTPUT_PATH))
-        aggregate_produced = True
+            scored = calculate_scores(aggregated)
+            export_aggregate_csv(scored, str(AGGREGATE_OUTPUT_PATH))
+            stats.aggregate_rows_written = len(scored)
+            aggregate_produced = True
+        except Exception as exc:
+            print(f"[WARN] Aggregate export skipped due to error: {exc}")
+            traceback.print_exc()
+            AGGREGATE_OUTPUT_PATH.unlink(missing_ok=True)
 
         print(f"Aggregate CSV produced: {'yes' if aggregate_produced else 'no'}")
-        print(f"Aggregate top rows: {len(scored)}")
+        print(f"Aggregate rows written: {stats.aggregate_rows_written}")
 
         if scored:
             print("\nTop 10 preview:")
