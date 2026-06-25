@@ -21,29 +21,6 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Validate Reddit secrets
-        env:
-          REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
-          REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
-          REDDIT_USER_AGENT: ${{ secrets.REDDIT_USER_AGENT }}
-        run: |
-          python - <<'PY'
-          import os
-          import sys
-
-          required = [
-              "REDDIT_CLIENT_ID",
-              "REDDIT_CLIENT_SECRET",
-              "REDDIT_USER_AGENT",
-          ]
-          missing = [name for name in required if not os.getenv(name)]
-          if missing:
-              print("Missing required GitHub Actions secrets:")
-              for name in missing:
-                  print(f"- {name}")
-              sys.exit(1)
-          PY
-
       - name: Run Reddit scraper
         env:
           REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}

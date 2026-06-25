@@ -2,15 +2,52 @@
 
 This project is a Reddit research pipeline for Novel Bridge.
 
-Novel Bridge helps international readers discover and legally read Asian web novels and related source works from Korea, China, and Japan. This scraper focuses on a specific business question: which titles show strong international continuation demand while also creating friction around official access, raw source access, or available translation.
+Novel Bridge helps international readers discover and legally read Asian web novels and related source works from Korea, China, and Japan. This scraper focuses on titles that show strong continuation demand together with high access friction.
 
-The script looks for three signal types across selected Reddit communities:
+The script writes a ranked CSV file named `reddit_demand_data.csv`.
 
-- Continuation intent, such as readers asking where to continue after an anime, manga, or manhwa adaptation.
-- Access pain, such as missing official releases, missing translations, or difficulty finding raws.
-- Platform friction, such as demand being trapped behind domestic-origin platforms like Naver Series, KakaoPage, Ridibooks, Syosetu, Kakuyomu, JJWXC, Qidian, or BookWalker.
+## Modes
 
-The output is a ranked CSV file named `reddit_demand_data.csv`.
+### Default mode: RSS/API-free
+
+By default, the scraper runs without Reddit API credentials.
+
+- Source: Reddit RSS search
+- Credentials required: none
+- Best for: immediate MVP runs in GitHub Actions and local smoke tests
+
+The scraper uses RSS URLs in this shape:
+
+`https://www.reddit.com/r/{subreddit}/search.rss?q={query}&restrict_sr=on&sort=relevance&t=year`
+
+### Optional mode: Reddit API via PRAW
+
+If these environment variables exist, the scraper switches to API mode automatically:
+
+- `REDDIT_CLIENT_ID`
+- `REDDIT_CLIENT_SECRET`
+- `REDDIT_USER_AGENT`
+
+In API mode, the scraper uses PRAW as the primary source and can inspect top-level comments in addition to post content.
+
+## Signals tracked
+
+The scraper looks for three signal families:
+
+- Continuation intent
+- Access pain
+- Platform friction
+
+It then ranks titles using:
+
+- `opportunity_score = continue_intent * access_pain`
+- `friction_weighted_score = continue_intent * (access_pain + platform_friction)`
+
+Results are sorted by:
+
+1. `friction_weighted_score` descending
+2. `opportunity_score` descending
+3. `total_mentions` descending
 
 ## Output columns
 
@@ -39,42 +76,25 @@ The output is a ranked CSV file named `reddit_demand_data.csv`.
 `-- requirements.txt
 ```
 
-## Reddit API credentials
-
-You need Reddit API credentials before running the scraper reliably in GitHub Actions.
-
-1. Go to [reddit.com/prefs/apps](https://www.reddit.com/prefs/apps).
-2. Click `create app` or `create another app`.
-3. Choose the app type `script`.
-4. Fill in a name such as `NovelBridgeResearch`.
-5. Set the redirect URI to `http://localhost:8080`.
-6. Save the app.
-7. Copy these values:
-   - `client_id`: the short string shown under the app name
-   - `client_secret`: the secret value
-   - a user agent string such as `NovelBridgeResearch/0.1 by your_reddit_username`
-
-## GitHub Secrets to add
-
-After the repository is on GitHub, add these repository secrets:
-
-- `REDDIT_CLIENT_ID`
-- `REDDIT_CLIENT_SECRET`
-- `REDDIT_USER_AGENT`
-
-Path in GitHub:
-
-`Settings` -> `Secrets and variables` -> `Actions` -> `New repository secret`
-
-## Run locally
-
-Create a Python environment if you want one, then install dependencies:
+## Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Set the environment variables before running the scraper.
+## Run locally
+
+### RSS mode
+
+No credentials are required:
+
+```bash
+python reddit_scraper.py
+```
+
+### PRAW mode
+
+Set these environment variables first.
 
 PowerShell:
 
@@ -102,13 +122,21 @@ setx REDDIT_CLIENT_SECRET "your_client_secret"
 setx REDDIT_USER_AGENT "NovelBridgeResearch/0.1 by your_reddit_username"
 ```
 
-Then restart the terminal and run:
+Then restart the terminal before running the scraper again.
 
-```bash
-python reddit_scraper.py
-```
+## Add GitHub secrets later
 
-If the run succeeds, it writes `reddit_demand_data.csv` in the project folder.
+GitHub Secrets are optional. The workflow runs in RSS mode when they are missing.
+
+If you want API mode later, add these repository secrets:
+
+- `REDDIT_CLIENT_ID`
+- `REDDIT_CLIENT_SECRET`
+- `REDDIT_USER_AGENT`
+
+Path in GitHub:
+
+`Settings` -> `Secrets and variables` -> `Actions` -> `New repository secret`
 
 ## GitHub Actions automation
 
@@ -118,33 +146,55 @@ The workflow file is:
 
 It runs in two ways:
 
-- On a schedule every day at `02:00 UTC`
-- Manually through the GitHub Actions tab with `workflow_dispatch`
+- Automatically every day at `02:00 UTC`
+- Manually from the `Actions` tab with `workflow_dispatch`
 
 Each workflow run:
 
 1. Checks out the repository
 2. Sets up Python 3.13
-3. Installs dependencies from `requirements.txt`
-4. Verifies that the required Reddit secrets exist
-5. Runs `python reddit_scraper.py`
-6. Uploads `reddit_demand_data.csv` as a workflow artifact named `reddit-demand-data`
+3. Installs dependencies
+4. Runs `python reddit_scraper.py`
+5. Uploads `reddit_demand_data.csv` as the `reddit-demand-data` artifact
 
-## Download the CSV artifact
-
-After a workflow run finishes:
+## How to manually run the workflow
 
 1. Open the repository on GitHub
-2. Go to `Actions`
-3. Open the latest `Novel Bridge Reddit Scraper` run
-4. Scroll to `Artifacts`
-5. Download `reddit-demand-data`
+2. Click `Actions`
+3. Select `Novel Bridge Reddit Scraper`
+4. Click `Run workflow`
+5. Open the completed run
+6. Download the `reddit-demand-data` artifact
 
-The downloaded ZIP contains `reddit_demand_data.csv`.
+## RSS mode limitations
+
+- RSS mode does not fetch Reddit comments
+- RSS mode does not provide reliable upvote counts, so `total_upvotes` stays `0`
+- RSS results can be less complete than API results
+- RSS search quality can vary by subreddit and keyword
+
+## API mode benefits
+
+- PRAW mode can inspect post bodies and top-level comments
+- PRAW mode can capture Reddit scores
+- PRAW mode is more flexible for future enrichment and filtering
+
+## Reddit API credentials
+
+To prepare for API mode:
+
+1. Go to [reddit.com/prefs/apps](https://www.reddit.com/prefs/apps)
+2. Click `create app` or `create another app`
+3. Choose the app type `script`
+4. Use a redirect URI such as `http://localhost:8080`
+5. Save the app
+6. Copy:
+   - `client_id`
+   - `client_secret`
+   - a user agent string such as `NovelBridgeResearch/0.1 by your_reddit_username`
 
 ## Notes
 
 - The scraper uses lightweight heuristics for title extraction.
-- Reddit search is useful for research, but not exhaustive.
 - The pipeline is intended for market research rather than production warehousing.
-- If credentials are missing during local runs, the script falls back to Reddit's public JSON search, which may have more limited coverage or be blocked by Reddit.
+- The script always writes `reddit_demand_data.csv`, even when no qualifying rows are found.
